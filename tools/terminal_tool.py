@@ -1115,6 +1115,190 @@ def _is_managed_multica_read_command(command: str) -> bool:
     return any(re.fullmatch(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
 
 
+def _is_managed_readonly_probe(command: str) -> bool:
+    """Allow only the fixed ACP environment probe, fail-closed on writes."""
+    normalized = command.strip()
+    required = (
+        "pwd",
+        "git status --short",
+        "git rev-parse --short HEAD",
+        "HERMES_PROFILE",
+        "HERMES_HOME",
+        "hermes-home",
+        "hermes --version",
+    )
+    forbidden = (
+        "rm ",
+        "touch ",
+        "mkdir ",
+        "rmdir ",
+        "del ",
+        "remove ",
+        "git add",
+        "git commit",
+        "git push",
+        "git reset",
+        "issue update",
+        "issue comment create",
+        "curl ",
+        "wget ",
+        " >>",
+        " > ",
+    )
+    return (
+        len(normalized) <= 5000
+        and all(token.lower() in normalized.lower() for token in required)
+        and not any(token.lower() in normalized.lower() for token in forbidden)
+    )
+
+
+def _execute_managed_readonly_probe_direct(
+    command: str,
+    **kwargs: Any,
+) -> dict:
+    """Run the allowlisted ACP probe with a fixed non-login Git Bash."""
+    from tools.environments.local import _find_bash, _resolve_safe_cwd
+
+    cwd = _resolve_safe_cwd(kwargs.get("cwd") or os.getcwd())
+    bash_candidates = (
+        r"C:\\Program Files\\Git\\bin\\bash.exe",
+        r"C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+    )
+    bash = next((candidate for candidate in bash_candidates if Path(candidate).is_file()), None)
+    if bash is None:
+        bash = _find_bash()
+    completed = subprocess.run(
+        [bash, "-c", command],
+        cwd=cwd,
+        env=_managed_multica_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=kwargs.get("timeout") or 120,
+    )
+    return {"output": completed.stdout or "", "returncode": completed.returncode, "cwd_observed": True}
+
+
+def _is_managed_readonly_fs_command(command: str) -> bool:
+    """Recognize the exact filesystem probes used by ACP bootstrap."""
+    normalized = command.strip()
+    if normalized.lower() in {"pwd", "git status --short", "git rev-parse --short head", "hermes --version"} or normalized.lower() == 'pwd && echo "--- git status --short ---" && git status --short':
+        return True
+    patterns = (
+        r"pwd",
+        r"pwd; echo [\"']pwd_exit=\$\?[\"']",
+        r"pwd && echo [\"']--- git status --short ---[\"'] && "
+        r"git status --short 2>&1; echo [\"']exit=\$\?[\"']",
+    )
+    return any(re.fullmatch(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _display_msys_cwd(cwd: str) -> str:
+    """Format a Windows CWD like Git Bash's ``pwd`` output."""
+    path = Path(cwd).resolve()
+    drive = path.drive.rstrip(":\\/").lower()
+    rest = path.as_posix()
+    if drive and rest[:2].lower() == f"{drive}:":
+        rest = rest[2:]
+    return f"/{drive}{rest}" if drive else rest
+
+
+def _execute_managed_readonly_fs_direct(
+    command: str,
+    **kwargs: Any,
+) -> dict:
+    """Execute the fixed ACP pwd/status probes without a shell wrapper."""
+    from tools.environments.local import _resolve_safe_cwd
+
+    cwd = _resolve_safe_cwd(kwargs.get("cwd") or os.getcwd())
+    pwd_line = _display_msys_cwd(cwd)
+    normalized = command.strip()
+    simple_commands = {
+        "git status --short": ["git", "status", "--short"],
+        "git rev-parse --short HEAD": ["git", "rev-parse", "--short", "HEAD"],
+        "hermes --version": [str(_HERMES_NATIVE_BIN), "--version"],
+    }
+    if normalized.lower() == "hermes --version" and not _HERMES_NATIVE_BIN.is_file():
+        simple_commands["hermes --version"] = ["hermes", "--version"]
+    argv = simple_commands.get(normalized)
+    if argv is not None:
+        result = subprocess.run(
+            argv,
+            cwd=cwd,
+            env=_managed_multica_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=kwargs.get("timeout") or 60,
+        )
+        return {"output": result.stdout or "", "returncode": result.returncode, "cwd_observed": True}
+    if normalized.lower() == "pwd":
+        output = f"{pwd_line}\n"
+        return {"output": output, "returncode": 0, "cwd_observed": True}
+    if re.fullmatch(r"pwd; echo [\"']pwd_exit=\$\?[\"']", normalized, flags=re.IGNORECASE):
+        output = f"{pwd_line}\npwd_exit=0\n"
+        return {"output": output, "returncode": 0, "cwd_observed": True}
+
+    result = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=cwd,
+        env=_managed_multica_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=kwargs.get("timeout") or 60,
+    )
+    output = f"{pwd_line}\n--- git status --short ---\n{result.stdout}exit={result.returncode}\n"
+    return {"output": output, "returncode": result.returncode, "cwd_observed": True}
+
+
+_MULTICA_NATIVE_BIN = Path(
+    r"C:\\Users\\Adel\\AppData\\Local\\Programs\\@multicadesktop\\resources\\app.asar.unpacked\\resources\\bin\\multica.exe"
+)
+
+
+_HERMES_NATIVE_BIN = Path("C:/Users/Adel/AppData/Local/hermes/hermes-agent/bin/hermes.exe")
+
+
+def _managed_multica_native_argv(command: str) -> list[str] | None:
+    """Translate an approved read-only Multica command to native argv."""
+    normalized = command.strip()
+    match = re.fullmatch(
+        r"multica(?:\.exe)? issue get ([A-Za-z0-9_-]+) --output json",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return [str(_MULTICA_NATIVE_BIN), "issue", "get", match.group(1), "--output", "json"]
+
+    match = re.fullmatch(
+        r"multica(?:\.exe)? issue comment list ([A-Za-z0-9_-]+) "
+        r"--roots-only --summary --compact --output json",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return [
+            str(_MULTICA_NATIVE_BIN),
+            "issue",
+            "comment",
+            "list",
+            match.group(1),
+            "--roots-only",
+            "--summary",
+            "--compact",
+            "--output",
+            "json",
+        ]
+    return None
+
+
 def _managed_multica_env() -> dict[str, str]:
     """Build the minimal task environment for the Multica CLI."""
     keep_exact = {
@@ -1154,19 +1338,32 @@ def _execute_managed_multica_direct(
     timeout = kwargs.get("timeout") or getattr(env, "timeout", 180)
     cwd = _resolve_safe_cwd(kwargs.get("cwd") or getattr(env, "cwd", None) or os.getcwd())
     logger.info("managed Multica subprocess start cwd=%s timeout=%s", cwd, timeout)
+    native_argv = _managed_multica_native_argv(command)
+    if native_argv is None:
+        return {
+            "output": "Command blocked: ACP task terminal allows read-only Multica queries only.\n",
+            "returncode": 126,
+            "cwd_observed": True,
+        }
     run_env = _managed_multica_env()
     logger.info("managed Multica subprocess env ready task=%s", os.environ.get("MULTICA_TASK_ID", "")[:8])
-    bash_candidates = (
-        r"C:\\Program Files\\Git\\bin\\bash.exe",
-        r"C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-    )
-    bash = next((candidate for candidate in bash_candidates if Path(candidate).is_file()), None)
-    if bash is None:
-        bash = _find_bash()
-    logger.info("managed Multica subprocess shell ready")
+    native_argv = _managed_multica_native_argv(command)
+    if native_argv is not None and _MULTICA_NATIVE_BIN.is_file():
+        run_argv = native_argv
+        logger.info("managed Multica native binary selected")
+    else:
+        bash_candidates = (
+            r"C:\\Program Files\\Git\\bin\\bash.exe",
+            r"C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+        )
+        bash = next((candidate for candidate in bash_candidates if Path(candidate).is_file()), None)
+        if bash is None:
+            bash = _find_bash()
+        run_argv = [bash, "-c", command]
+        logger.info("managed Multica subprocess shell ready")
     try:
         completed = subprocess.run(
-            [bash, "-c", command],
+            run_argv,
             cwd=cwd,
             env=run_env,
             stdout=subprocess.PIPE,
@@ -1197,8 +1394,16 @@ def _execute_with_task_lock(env: Any, task_id: str, command: str, **kwargs: Any)
     with _execution_locks_lock:
         lock = _execution_locks.setdefault(key, threading.Lock())
     with lock:
-        if task_id and command.lstrip().lower().startswith(("multica ", "multica.exe ")):
+        if (
+            task_id
+            and os.environ.get("MULTICA_TASK_ID", "").strip() == task_id
+            and command.lstrip().lower().startswith(("multica ", "multica.exe "))
+        ):
             return _execute_managed_multica_direct(env, command, **kwargs)
+        if task_id and os.environ.get("MULTICA_TASK_ID", "").strip() == task_id and _is_managed_readonly_probe(command):
+            return _execute_managed_readonly_probe_direct(command, **kwargs)
+        if task_id and os.environ.get("MULTICA_TASK_ID", "").strip() == task_id and _is_managed_readonly_fs_command(command):
+            return _execute_managed_readonly_fs_direct(command, **kwargs)
         return env.execute(command, **kwargs)
 
 
@@ -2835,15 +3040,33 @@ def terminal_tool(
         if (
             not background
             and os.environ.get("MULTICA_TASK_ID", "").strip()
-            and _is_managed_multica_read_command(command)
-        ):
-            logger.info("managed Multica direct terminal path task=%s", effective_task_id[:8])
-            direct_result = _execute_managed_multica_direct(
-                None,
-                command,
-                timeout=effective_timeout,
-                cwd=cwd,
+            and effective_task_id == os.environ.get("MULTICA_TASK_ID", "").strip()
+            and (
+                _is_managed_multica_read_command(command)
+                or _is_managed_readonly_fs_command(command)
+                or _is_managed_readonly_probe(command)
             )
+        ):
+            logger.info("managed read-only direct terminal path task=%s", effective_task_id[:8])
+            if _is_managed_multica_read_command(command):
+                direct_result = _execute_managed_multica_direct(
+                    None,
+                    command,
+                    timeout=effective_timeout,
+                    cwd=cwd,
+                )
+            elif _is_managed_readonly_probe(command):
+                direct_result = _execute_managed_readonly_probe_direct(
+                    command,
+                    timeout=effective_timeout,
+                    cwd=cwd,
+                )
+            else:
+                direct_result = _execute_managed_readonly_fs_direct(
+                    command,
+                    timeout=effective_timeout,
+                    cwd=cwd,
+                )
             return json.dumps(
                 {
                     "output": direct_result.get("output", ""),

@@ -113,8 +113,61 @@ def test_managed_multica_read_command_is_narrowly_classified():
     assert terminal_tool._is_managed_multica_read_command("multica issue update issue-id --title x") is False
 
 
+def test_managed_multica_native_argv_avoids_shell_wrapper():
+    argv = terminal_tool._managed_multica_native_argv(
+        "multica issue get issue-id --output json"
+    )
+    assert argv is not None
+    assert argv[0].lower().endswith("multica.exe")
+    assert argv[1:] == ["issue", "get", "issue-id", "--output", "json"]
+
+
+def test_managed_readonly_probe_is_allowlisted():
+    command = (
+        "echo '--- 1. pwd ---' && pwd && echo '--- 2. git status --short ---' "
+        "&& (git status --short 2>&1 || echo '<git error>') && "
+        "echo '--- 3. git rev-parse HEAD ---' && "
+        "(git rev-parse --short HEAD 2>&1 || echo '<no commits>') && "
+        "echo '--- 4. profile env vars ---' && "
+        "echo \\\"HERMES_PROFILE=${HERMES_PROFILE:-<unset>}\\\" && "
+        "echo \\\"HERMES_HOME=${HERMES_HOME:-<unset>}\\\" && "
+        "echo '--- 5. hermes-home contents ---' && ls \\\"$HOME/multica_workspaces_desktop-api.multica.ai/0eb7bbfc-9723-45d2-8122-18a1c6605506/task/hermes-home\\\" 2>&1 && "
+        "echo '--- 6. hermes-home/profiles ---' && ls \\\"$HOME/multica_workspaces_desktop-api.multica.ai/0eb7bbfc-9723-45d2-8122-18a1c6605506/task/hermes-home/profiles\\\" 2>&1 && "
+        "echo '--- 7. hermes version ---' && (hermes --version 2>&1 | head -3 || echo '<hermes CLI unavailable>')"
+    )
+    assert terminal_tool._is_managed_readonly_probe(command) is True
+    assert terminal_tool._is_managed_readonly_probe(command + " && touch x") is False
+
+
+def test_managed_readonly_fs_command_is_narrowly_classified():
+    assert terminal_tool._is_managed_readonly_fs_command("pwd") is True
+    assert terminal_tool._is_managed_readonly_fs_command("git status --short") is True
+    assert terminal_tool._is_managed_readonly_fs_command("git rev-parse --short HEAD") is True
+    assert terminal_tool._is_managed_readonly_fs_command("hermes --version") is True
+    assert terminal_tool._is_managed_readonly_fs_command('pwd && echo "--- git status --short ---" && git status --short') is True
+    assert terminal_tool._is_managed_readonly_fs_command('pwd; echo "pwd_exit=$?"') is True
+    assert terminal_tool._is_managed_readonly_fs_command('pwd && echo "--- git status --short ---" && git status --short 2>&1; echo "exit=$?"') is True
+    assert terminal_tool._is_managed_readonly_fs_command("git status --short && rm -rf x") is False
+
+
+def test_unknown_managed_multica_command_is_blocked_not_shell(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("shell invoked")),
+    )
+    result = terminal_tool._execute_managed_multica_direct(
+        None,
+        "multica issue status issue-id in_progress --no-start",
+        timeout=1,
+    )
+    assert result["returncode"] == 126
+    assert "read-only" in result["output"]
+
+
 def test_managed_multica_command_uses_direct_executor(monkeypatch):
     """Task-scoped Multica API calls bypass the wedged shell wrapper only."""
+    monkeypatch.setenv("MULTICA_TASK_ID", "task-id")
     class FakeEnvironment:
         def execute(self, *_args, **_kwargs):
             raise AssertionError("LocalEnvironment wrapper should not run")
