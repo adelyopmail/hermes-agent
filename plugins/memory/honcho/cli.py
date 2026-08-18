@@ -1165,11 +1165,13 @@ def cmd_status(args) -> None:
     api_key = hcfg.api_key or ""
     masked = f"...{api_key[-8:]}" if len(api_key) > 8 else ("set" if api_key else "not set")
 
-    # Auth line distinguishes an OAuth grant (refreshable) from a static API key
-    # — the OAuth access token is also stored under apiKey, so masking alone hides it.
+    # Auth line distinguishes a static API key from an OAuth grant. When the
+    # durable HONCHO_API_KEY env credential is present, it wins over legacy
+    # OAuth material in the host block and must be displayed as the active mode.
+    from agent.secret_scope import get_secret
     from plugins.memory.honcho.oauth import OAuthCredential
     host_block = (getattr(hcfg, "raw", None) or {}).get("hosts", {}).get(hcfg.host) or {}
-    cred = OAuthCredential.from_host_block(host_block)
+    cred = None if get_secret("HONCHO_API_KEY") else OAuthCredential.from_host_block(host_block)
 
     profile = _active_profile_name()
     profile_label = f" [{hcfg.host}]" if profile != "default" else ""
