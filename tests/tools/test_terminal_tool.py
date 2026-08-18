@@ -122,6 +122,17 @@ def test_managed_multica_native_argv_avoids_shell_wrapper():
     assert argv[1:] == ["issue", "get", "issue-id", "--output", "json"]
 
 
+def test_managed_readonly_command_accepts_safe_probe_variants():
+    command = "pwd; printf '\\n--- git status --short ---\\n'; git status --short; printf '\\n--- git root ---\\n'; git rev-parse --show-toplevel 2>&1"
+    assert terminal_tool._is_managed_readonly_command(command) is True
+    assert terminal_tool._is_managed_readonly_command("pwd && git status --short && multica issue status DEVOPS-55 in_progress") is False
+
+
+def test_managed_readonly_command_rejects_shell_writes():
+    for command in ("pwd && touch marker", "git status --short > report.txt", "printf x | tee report.txt"):
+        assert terminal_tool._is_managed_readonly_command(command) is False
+
+
 def test_managed_readonly_probe_is_allowlisted():
     command = (
         "echo '--- 1. pwd ---' && pwd && echo '--- 2. git status --short ---' "
@@ -163,6 +174,15 @@ def test_unknown_managed_multica_command_is_blocked_not_shell(monkeypatch):
     )
     assert result["returncode"] == 126
     assert "read-only" in result["output"]
+
+
+def test_acp_task_iteration_budget_is_scoped(monkeypatch):
+    from acp_adapter import session
+
+    monkeypatch.setenv("MULTICA_TASK_ID", "task-id")
+    assert session._acp_task_max_iterations() == 8
+    monkeypatch.delenv("MULTICA_TASK_ID", raising=False)
+    assert session._acp_task_max_iterations() is None
 
 
 def test_managed_multica_command_uses_direct_executor(monkeypatch):

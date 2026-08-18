@@ -25,6 +25,13 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_ACP_TASK_MAX_ITERATIONS = 8
+
+
+def _acp_task_max_iterations() -> int | None:
+    """Return a short turn budget for daemon-launched Multica ACP tasks."""
+    return _ACP_TASK_MAX_ITERATIONS if os.environ.get("MULTICA_TASK_ID", "").strip() else None
+
 
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values when Hermes itself is running in WSL.
@@ -686,6 +693,9 @@ class SessionManager:
             "session_db": self._get_db(),
             "model": effective_model,
         }
+        task_max_iterations = _acp_task_max_iterations()
+        if task_max_iterations is not None:
+            kwargs["max_iterations"] = task_max_iterations
 
         try:
             runtime = resolve_runtime_provider(requested=effective_provider)

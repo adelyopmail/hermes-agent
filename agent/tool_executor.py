@@ -98,6 +98,9 @@ _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+# ACP/Multica terminal calls are short probes. Keep the legacy global deadline
+# for ordinary Hermes work, but never let a task-scoped terminal wedge consume it.
+_ACP_TASK_TERMINAL_TIMEOUT_S = 60.0
 # Upper bound a concurrent worker will wait at the start-order gate for all
 # earlier-ordered tools to advance before proceeding out of order. Long enough
 # to cover slow-but-legitimate authorization (e.g. an approval round-trip),
@@ -751,26 +754,43 @@ def _run_agent_tool_execution_middleware(
 _SEQUENTIAL_INTERRUPT_POLL_SECONDS = 1.0
 
 
-def _resolve_sequential_tool_timeout() -> float | None:
+def _cap_acp_terminal_timeout(
+    timeout_s: float | None,
+    *,
+    effective_task_id: str | None,
+    terminal_only: bool,
+) -> float | None:
+    """Cap task-scoped terminal batches without changing global Hermes timeouts."""
+    task_id = os.environ.get("MULTICA_TASK_ID", "").strip()
+    if not terminal_only or not task_id:
+        return timeout_s
+    if timeout_s is None:
+        return _ACP_TASK_TERMINAL_TIMEOUT_S
+    return min(timeout_s, _ACP_TASK_TERMINAL_TIMEOUT_S)
+
+
+def _resolve_sequential_tool_timeout(
+    *,
+    effective_task_id: str | None = None,
+    function_name: str | None = None,
+) -> float | None:
     """Deadline for one sequential tool call (#85125 Phase 2a).
 
     ``timeouts.tools.sequential_call`` in config.yaml wins; when unset, the
-    sequential path inherits the concurrent batch deadline (same value, same
-    ``HERMES_CONCURRENT_TOOL_TIMEOUT_S`` legacy bridge) so the two executor
-    paths cannot drift apart by default. ``0``/negative disables the bound.
-
-    NOTE: this path deliberately does NOT use ``agent.deadline.run_bounded_sync``.
-    The sequential/concurrent executors extend their deadline dynamically while
-    a human approval prompt is open (``_ConcurrentToolAuthorizationGate``
-    excluded seconds — a MUST-preserve invariant) and touch agent activity
-    mid-wait; the shared primitive is fixed-deadline by design. Simpler call
-    sites migrate onto the primitive; these two stay symmetric with each other.
+    sequential path inherits the concurrent batch deadline. ACP task-scoped
+    terminal calls are capped separately because their read-only probes must
+    never inherit the 420s general-purpose batch deadline.
     """
     from agent.deadline import resolve_timeout
 
-    return resolve_timeout(
+    timeout_s = resolve_timeout(
         "tools.sequential_call",
         default=_resolve_concurrent_tool_timeout(),
+    )
+    return _cap_acp_terminal_timeout(
+        timeout_s,
+        effective_task_id=effective_task_id,
+        terminal_only=function_name == "terminal",
     )
 
 
@@ -793,7 +813,10 @@ def _run_sequential_tool_execution_middleware(
     ``<= 0``) owns that wait. Applying the generic tool deadline here would
     return ``tool_timeout`` while the prompt and worker stay active.
     """
-    timeout_s = _resolve_sequential_tool_timeout()
+    timeout_s = _resolve_sequential_tool_timeout(
+        effective_task_id=effective_task_id,
+        function_name=function_name,
+    )
     kwargs = {
         "function_name": function_name,
         "function_args": function_args,
@@ -1246,7 +1269,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     # Resolved before the workers are defined so the start-order gate can clamp
     # its own bound against the batch deadline it must stay under.
-    timeout_s = _resolve_concurrent_tool_timeout()
+    terminal_only_batch = bool(parsed_calls) and all(
+        name == "terminal" for _, name, _, _, _, _ in parsed_calls
+    )
+    timeout_s = _cap_acp_terminal_timeout(
+        _resolve_concurrent_tool_timeout(),
+        effective_task_id=effective_task_id,
+        terminal_only=terminal_only_batch,
+    )
     gate_timeout_s = _start_order_gate_timeout(timeout_s)
 
     # Touch activity before launching workers so the gateway knows
