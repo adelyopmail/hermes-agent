@@ -1,0 +1,64 @@
+name: ACP targeted validation
+
+on:
+  pull_request:
+    paths:
+      - 'acp_adapter/**'
+      - 'agent/**'
+      - 'hermes_cli/env_loader.py'
+      - 'tools/**'
+      - 'tests/acp/**'
+      - 'tests/acp_adapter/**'
+      - 'tests/agent/**'
+      - 'tests/hermes_cli/**'
+      - 'tests/tools/**'
+      - '.github/workflows/acp-targeted.yml'
+  push:
+    branches:
+      - main
+      - fix/acp-multica-timeout
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acp-targeted-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  targeted:
+    name: ACP terminal and routing tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.8.17'
+
+      - name: Run targeted tests
+        run: >-
+          uv run --with pytest --with pytest-asyncio
+          --with agent-client-protocol==0.9.0 pytest -q
+          tests/tools/test_terminal_tool.py
+          tests/agent/test_deadline.py
+          tests/tools/test_terminal_task_cwd.py
+          tests/tools/test_terminal_env_bridge.py
+          tests/tools/test_local_env_blocklist.py
+          tests/hermes_cli/test_env_loader.py
+          tests/acp_adapter/test_acp_commands.py
+          tests/acp/test_server.py
+
+      - name: Compile changed Python modules
+        run: >-
+          uv run python -m py_compile
+          acp_adapter/server.py
+          acp_adapter/session.py
+          agent/deadline.py
+          agent/tool_executor.py
+          hermes_cli/env_loader.py
+          tools/environments/local.py
+          tools/terminal_tool.py
