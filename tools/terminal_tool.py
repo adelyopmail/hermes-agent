@@ -1093,6 +1093,8 @@ _last_activity: Dict[str, float] = {}
 _env_lock = threading.Lock()
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
+_execution_locks: Dict[str, threading.Lock] = {}
+_execution_locks_lock = threading.Lock()
 _cleanup_thread = None
 _cleanup_running = False
 
@@ -1101,6 +1103,103 @@ _cleanup_running = False
 # calls for parallel subagents won't re-trigger the sweep.
 _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
+
+
+def _is_managed_multica_read_command(command: str) -> bool:
+    """Recognize only the exact read-only Multica bootstrap commands."""
+    normalized = command.strip()
+    patterns = (
+        r"multica(?:\.exe)? issue get [A-Za-z0-9_-]+ --output json",
+        r"multica(?:\.exe)? issue comment list [A-Za-z0-9_-]+ --roots-only --summary --compact --output json",
+    )
+    return any(re.fullmatch(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _managed_multica_env() -> dict[str, str]:
+    """Build the minimal task environment for the Multica CLI."""
+    keep_exact = {
+        "HERMES_HOME",
+        "HOME",
+        "USERPROFILE",
+        "TEMP",
+        "TMP",
+        "COMSPEC",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+    }
+    result = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper().startswith("MULTICA_")
+        or key in keep_exact
+        or key.upper() == "PATH"
+    }
+    task_token = os.environ.get("_HERMES_FORCE_MULTICA_TOKEN") or os.environ.get("MULTICA_TOKEN", "")
+    if task_token.startswith("mat_"):
+        result["MULTICA_TOKEN"] = task_token
+    result.setdefault("MSYS_NO_PATHCONV", "1")
+    result.setdefault("MSYS2_ARG_CONV_EXCL", "*")
+    return result
+
+
+def _execute_managed_multica_direct(
+    env: Any,
+    command: str,
+    **kwargs: Any,
+) -> dict:
+    """Run a task-local Multica CLI command without the login-shell wrapper."""
+    from tools.environments.local import _find_bash, _make_run_env, _resolve_safe_cwd
+
+    timeout = kwargs.get("timeout") or getattr(env, "timeout", 180)
+    cwd = _resolve_safe_cwd(kwargs.get("cwd") or getattr(env, "cwd", None) or os.getcwd())
+    logger.info("managed Multica subprocess start cwd=%s timeout=%s", cwd, timeout)
+    run_env = _managed_multica_env()
+    logger.info("managed Multica subprocess env ready task=%s", os.environ.get("MULTICA_TASK_ID", "")[:8])
+    bash_candidates = (
+        r"C:\\Program Files\\Git\\bin\\bash.exe",
+        r"C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+    )
+    bash = next((candidate for candidate in bash_candidates if Path(candidate).is_file()), None)
+    if bash is None:
+        bash = _find_bash()
+    logger.info("managed Multica subprocess shell ready")
+    try:
+        completed = subprocess.run(
+            [bash, "-c", command],
+            cwd=cwd,
+            env=run_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        logger.info("managed Multica subprocess finished returncode=%s", completed.returncode)
+        return {
+            "output": completed.stdout or "",
+            "returncode": completed.returncode,
+            "cwd_observed": True,
+        }
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        return {
+            "output": f"{output}\n[Command timed out after {timeout}s]".lstrip(),
+            "returncode": 124,
+            "cwd_observed": True,
+        }
+
+
+def _execute_with_task_lock(env: Any, task_id: str, command: str, **kwargs: Any) -> dict:
+    """Serialize commands that share one terminal environment."""
+    key = task_id or "default"
+    with _execution_locks_lock:
+        lock = _execution_locks.setdefault(key, threading.Lock())
+    with lock:
+        if task_id and command.lstrip().lower().startswith(("multica ", "multica.exe ")):
+            return _execute_managed_multica_direct(env, command, **kwargs)
+        return env.execute(command, **kwargs)
 
 
 def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
@@ -1382,6 +1481,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     ``delegate_task`` children keep sharing the parent's container via the
     alias registry (``register_container_alias``).
     """
+    managed_task_id = os.environ.get("MULTICA_TASK_ID", "").strip()
+    if managed_task_id:
+        # The daemon task identity is authoritative even when the tool adapter
+        # passes a session id or the implicit ``default`` placeholder.
+        return managed_task_id
+
     if task_id and _has_isolation_overrides(task_id):
         return task_id
     if task_id and _docker_session_isolation_enabled():
@@ -2727,6 +2832,27 @@ def terminal_tool(
             )
         effective_timeout = timeout or default_timeout
 
+        if (
+            not background
+            and os.environ.get("MULTICA_TASK_ID", "").strip()
+            and _is_managed_multica_read_command(command)
+        ):
+            logger.info("managed Multica direct terminal path task=%s", effective_task_id[:8])
+            direct_result = _execute_managed_multica_direct(
+                None,
+                command,
+                timeout=effective_timeout,
+                cwd=cwd,
+            )
+            return json.dumps(
+                {
+                    "output": direct_result.get("output", ""),
+                    "exit_code": direct_result.get("returncode", 1),
+                    "error": None,
+                },
+                ensure_ascii=False,
+            )
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
@@ -2921,9 +3047,11 @@ def terminal_tool(
                 # redirect keeps leading-dash paths out of argv (same form as
                 # tools/image_source.py).
                 try:
-                    result = env.execute(
+                    result = _execute_with_task_lock(
+                        env,
+                        effective_task_id,
                         f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
-                        f"< {shlex.quote(script_path)}"
+                        f"< {shlex.quote(script_path)}",
                     )
                     if result.get("returncode", -1) == 0:
                         output = result.get("output", "")
@@ -3349,7 +3477,12 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    result = _execute_with_task_lock(
+                        env,
+                        effective_task_id,
+                        command,
+                        **execute_kwargs,
+                    )
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

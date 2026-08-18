@@ -207,13 +207,28 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".") -> SessionState:
+    def create_session(
+        self,
+        cwd: str = ".",
+        *,
+        model: str | None = None,
+        requested_provider: str | None = None,
+        base_url: str | None = None,
+        api_mode: str | None = None,
+    ) -> SessionState:
         """Create a new session with a unique ID and a fresh AIAgent."""
         import threading
 
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=session_id, cwd=cwd)
+        agent = self._make_agent(
+            session_id=session_id,
+            cwd=cwd,
+            model=model,
+            requested_provider=requested_provider,
+            base_url=base_url,
+            api_mode=api_mode,
+        )
         state = SessionState(
             session_id=session_id,
             agent=agent,
@@ -626,6 +641,34 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
+        effective_model = model or default_model
+        effective_provider = requested_provider or config_provider
+        if effective_model and "/" in effective_model:
+            # Multica passes qualified ids such as
+            # ``opencode-go/deepseek-v4-flash`` to ACP. The regular Hermes
+            # CLI resolves this through its explicit --provider flag, but ACP
+            # session/new may provide only the model string. Split the provider
+            # at this boundary so a shared Codex default cannot reject a model
+            # owned by another provider.
+            provider_prefix, model_suffix = effective_model.split("/", 1)
+            if provider_prefix and model_suffix:
+                effective_provider = provider_prefix
+                effective_model = model_suffix
+        if effective_model:
+            try:
+                from hermes_cli.models import parse_model_input
+
+                parsed_provider, parsed_model = parse_model_input(
+                    effective_model,
+                    effective_provider or "auto",
+                )
+                if parsed_model:
+                    effective_model = parsed_model
+                if parsed_provider:
+                    effective_provider = parsed_provider
+            except Exception:
+                logger.debug("ACP model/provider parsing failed", exc_info=True)
+
         configured_mcp_servers = [
             name
             for name, cfg in (config.get("mcp_servers") or {}).items()
@@ -641,11 +684,11 @@ class SessionManager:
             "quiet_mode": True,
             "session_id": session_id,
             "session_db": self._get_db(),
-            "model": model or default_model,
+            "model": effective_model,
         }
 
         try:
-            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            runtime = resolve_runtime_provider(requested=effective_provider)
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),

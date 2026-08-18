@@ -826,6 +826,11 @@ class HermesACPAgent(acp.Agent):
         target_provider = current_provider
         new_model = raw_model.strip()
 
+        if "/" in new_model:
+            provider_prefix, model_suffix = new_model.split("/", 1)
+            if provider_prefix and model_suffix:
+                return provider_prefix, model_suffix
+
         try:
             from hermes_cli.models import detect_provider_for_model, parse_model_input
 
@@ -1438,7 +1443,13 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        state = self.session_manager.create_session(cwd=cwd)
+        state = self.session_manager.create_session(
+            cwd=cwd,
+            model=kwargs.get("model"),
+            requested_provider=kwargs.get("provider") or kwargs.get("requested_provider"),
+            base_url=kwargs.get("base_url"),
+            api_mode=kwargs.get("api_mode"),
+        )
         await self._register_session_mcp_servers(state, mcp_servers)
         self._schedule_mcp_late_refresh(state)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)

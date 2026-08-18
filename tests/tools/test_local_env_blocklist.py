@@ -1091,6 +1091,51 @@ class TestProfileScopedPassthrough:
 
         assert result["SERVICE_TOKEN"] == "token-for-routed-profile"
 
+    def test_task_scoped_multica_force_beats_workspace_overlay(self, monkeypatch):
+        """A daemon task token must survive a workspace-token overlay."""
+        from tools.environments.local import _make_run_env
+
+        monkeypatch.setenv("MULTICA_TOKEN", "mul_workspace_token")
+        monkeypatch.setenv("_HERMES_FORCE_MULTICA_TOKEN", "mat_task_token")
+
+        result = _make_run_env({})
+
+        assert result["MULTICA_TOKEN"] == "mat_task_token"
+
+
+    def test_task_identity_keeps_mat_token_out_of_profile_scope(self, monkeypatch):
+        """Task identity makes mat_ authoritative over a routed mul_ scope."""
+        from agent import secret_scope as ss
+        from tools.env_passthrough import clear_env_passthrough, register_env_passthrough
+        from tools.environments.local import _make_run_env
+
+        clear_env_passthrough()
+        register_env_passthrough(["MULTICA_TOKEN"])
+        monkeypatch.setenv("MULTICA_TASK_ID", "task-id")
+        monkeypatch.setenv("MULTICA_TOKEN", "mat_task_token")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"MULTICA_TOKEN": "mul_workspace_token"})
+        try:
+            result = _make_run_env({})
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+            clear_env_passthrough()
+
+        assert result["MULTICA_TOKEN"] == "mat_task_token"
+
+
+    def test_multica_task_skips_login_snapshot(self, monkeypatch, tmp_path):
+        """ACP tasks use non-login bash instead of blocking on user profiles."""
+        monkeypatch.setenv("MULTICA_TASK_ID", "task-id")
+
+        with patch.object(LocalEnvironment, "init_session") as init_session:
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+
+        init_session.assert_not_called()
+        assert env._prefer_nonlogin is True
+
+
     def test_make_run_env_omits_missing_scoped_passthrough(self, monkeypatch):
         """A missing routed secret must not fall back to the default profile."""
         from agent import secret_scope as ss
