@@ -492,6 +492,26 @@ def test_shell_exported_credentials_survive_cleanup(tmp_path, monkeypatch):
     assert "HERMES_ACP_AUTH_METHOD" not in os.environ
 
 
+def test_task_scoped_multica_token_survives_profile_env_override(tmp_path, monkeypatch):
+    """A daemon-injected mat_ token must beat a profile .env mul_ token.
+
+    Multica ACP injects a task-scoped token in the process environment. Profile
+    dotenv files may also contain the workspace token used by the interactive
+    CLI. The task token is the authoritative credential for an ACP worker and
+    must survive every dotenv/managed-env reload.
+    """
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text("MULTICA_TOKEN=mul_workspace_token\n", encoding="utf-8")
+
+    monkeypatch.setenv("MULTICA_TOKEN", "mat_task_scoped_token")
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["MULTICA_TOKEN"] == "mat_task_scoped_token"
+    assert os.environ["_HERMES_FORCE_MULTICA_TOKEN"] == "mat_task_scoped_token"
+
+
 def test_cleanup_scope_is_the_profile_managed_set():
     """Lock the invariant: the startup scrub set contains only behavioral
     ACP/routing keys — never credential-shaped keys. If this fails, someone

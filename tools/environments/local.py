@@ -1292,6 +1292,13 @@ def _make_run_env(env: dict) -> dict:
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     merged = dict(os.environ | env)
+    task_token = os.environ.get("_HERMES_FORCE_MULTICA_TOKEN") or os.environ.get("MULTICA_TOKEN", "")
+    if os.environ.get("MULTICA_TASK_ID") and task_token.startswith("mat_"):
+        # Multica task credentials are authoritative for task-local API calls.
+        # Do not let the active multiplex profile scope replace mat_ with the
+        # workspace mul_ token while building the terminal child environment.
+        merged["MULTICA_TOKEN"] = task_token
+        merged["_HERMES_FORCE_MULTICA_TOKEN"] = task_token
     run_env = {}
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -1718,7 +1725,13 @@ class LocalEnvironment(BaseEnvironment):
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
-        self.init_session()
+        if os.environ.get("MULTICA_TASK_ID", "").strip():
+            # Managed ACP tasks must not inherit a potentially interactive or
+            # blocking user login profile. Their task env and PATH are already
+            # prepared by the daemon; use the safe non-login fallback directly.
+            self._prefer_nonlogin = True
+        else:
+            self.init_session()
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.

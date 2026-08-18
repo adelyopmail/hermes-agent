@@ -3,6 +3,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 from acp.schema import TextContentBlock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from acp_adapter.server import HermesACPAgent
 from acp_adapter.session import SessionManager
@@ -73,6 +74,16 @@ def make_agent_and_state():
     return acp_agent, state, fake, conn
 
 
+def test_acp_task_profile_identity_is_read_from_multica_workdir(tmp_path):
+    from acp_adapter.session import _task_profile_identity
+
+    (tmp_path / "AGENTS.md").write_text(
+        "**You are: Engineer A** (ID: `917120f4-d494-4fbb-9636-62627e8efa87`)\n",
+        encoding="utf-8",
+    )
+    assert _task_profile_identity(str(tmp_path)) == "engineer-a"
+
+
 def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     """ACP sessions persist to SessionDB; recall must receive the same DB handle."""
     captured = {}
@@ -117,7 +128,104 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     assert isinstance(agent, CapturingAgent)
     assert captured["session_db"] is sentinel_db
     assert captured["platform"] == "acp"
+    assert captured["provider"] == "p"
     assert captured["session_id"] == "acp-session"
+
+
+def test_qualified_model_selects_its_provider(monkeypatch):
+    """A provider/model id from Multica must override the ACP config provider."""
+    captured = {}
+
+    class CapturingAgent(FakeAgent):
+        def __init__(self, **kwargs):
+            super().__init__()
+            captured.update(kwargs)
+
+    def mod(name, **attrs):
+        module = ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    def resolve_runtime_provider(**kwargs):
+        captured["requested_provider"] = kwargs.get("requested")
+        return {
+            "provider": kwargs.get("requested") or "openai-codex",
+            "api_mode": "chat_completions",
+            "base_url": "https://opencode.ai/zen/go/v1",
+            "api_key": "key",
+            "command": None,
+            "args": [],
+        }
+
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=CapturingAgent))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "gpt-5.6-luna", "provider": "openai-codex"}}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        mod("hermes_cli.runtime_provider", resolve_runtime_provider=resolve_runtime_provider),
+    )
+
+    manager = SessionManager(db=NoopDb())
+    agent = manager._make_agent(
+        session_id="acp-session",
+        cwd=".",
+        model="opencode-go/deepseek-v4-flash",
+    )
+
+    assert isinstance(agent, CapturingAgent)
+    assert captured["model"] == "deepseek-v4-flash"
+    assert captured["requested_provider"] == "opencode-go"
+    assert captured["provider"] == "opencode-go"
+
+
+@pytest.mark.asyncio
+async def test_new_session_forwards_model_and_provider(monkeypatch):
+    """ACP session/new must pass Multica's model/provider to SessionManager."""
+    captured = {}
+    state = SimpleNamespace(
+        session_id="acp-session",
+        cwd=".",
+        agent=SimpleNamespace(model="deepseek-v4-flash", provider="opencode-go"),
+    )
+
+    class RecordingManager:
+        def create_session(self, **kwargs):
+            captured.update(kwargs)
+            return state
+
+    acp_agent = HermesACPAgent(session_manager=RecordingManager())
+    monkeypatch.setattr(acp_agent, "_register_session_mcp_servers", AsyncMock())
+    monkeypatch.setattr(acp_agent, "_schedule_mcp_late_refresh", lambda *_args: None)
+    monkeypatch.setattr(acp_agent, "_schedule_available_commands_update", lambda *_args: None)
+    monkeypatch.setattr(acp_agent, "_schedule_usage_update", lambda *_args: None)
+    monkeypatch.setattr(acp_agent, "_build_model_state", lambda *_args: None)
+    monkeypatch.setattr(acp_agent, "_session_modes", lambda *_args: None)
+    monkeypatch.setattr(acp_agent, "_provenance_meta", lambda *_args: None)
+
+    await acp_agent.new_session(
+        cwd=".",
+        model="opencode-go/deepseek-v4-flash",
+        provider="opencode-go",
+    )
+
+    assert captured["cwd"] == "."
+    assert captured["model"] == "opencode-go/deepseek-v4-flash"
+    assert captured["requested_provider"] == "opencode-go"
+    assert captured["base_url"] is None
+    assert captured["api_mode"] is None
+
+
+def test_qualified_model_selection_overrides_current_provider():
+    """ACP model switching must honor provider/model ids from Multica."""
+    assert HermesACPAgent._resolve_model_selection(
+        "opencode-go/deepseek-v4-flash",
+        "openai-codex",
+    ) == ("opencode-go", "deepseek-v4-flash")
 
 
 @pytest.mark.asyncio

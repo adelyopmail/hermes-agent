@@ -519,3 +519,23 @@ class TestSequentialToolTimeoutResolver:
             lambda: {"tools": {"concurrent_batch": 0}},
         )
         assert self._resolver()() is None
+
+    def test_acp_terminal_task_is_capped_without_changing_global_default(self, monkeypatch):
+        monkeypatch.setattr("agent.deadline._timeouts_section", lambda: {})
+        monkeypatch.delenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", raising=False)
+        monkeypatch.setenv("MULTICA_TASK_ID", "task-id")
+        from agent import tool_executor
+
+        assert tool_executor._resolve_sequential_tool_timeout(
+            effective_task_id="task-id", function_name="terminal"
+        ) == 60.0
+        assert tool_executor._resolve_sequential_tool_timeout(
+            effective_task_id="other-task", function_name="terminal"
+        ) == 60.0
+        monkeypatch.delenv("MULTICA_TASK_ID", raising=False)
+        assert tool_executor._resolve_sequential_tool_timeout(
+            effective_task_id="other-task", function_name="terminal"
+        ) == 420.0
+        assert tool_executor._resolve_sequential_tool_timeout(
+            effective_task_id="task-id", function_name="read_file"
+        ) == 420.0

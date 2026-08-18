@@ -1093,6 +1093,8 @@ _last_activity: Dict[str, float] = {}
 _env_lock = threading.Lock()
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
+_execution_locks: Dict[str, threading.Lock] = {}
+_execution_locks_lock = threading.Lock()
 _cleanup_thread = None
 _cleanup_running = False
 
@@ -1101,6 +1103,484 @@ _cleanup_running = False
 # calls for parallel subagents won't re-trigger the sweep.
 _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
+
+
+def _is_managed_multica_read_command(command: str) -> bool:
+    """Recognize only the exact read-only Multica bootstrap commands."""
+    normalized = command.strip()
+    patterns = (
+        r"multica(?:\.exe)? issue get [A-Za-z0-9_-]+ --output json",
+        r"multica(?:\.exe)? issue comment list [A-Za-z0-9_-]+ --roots-only --summary --compact --output json",
+    )
+    return any(re.fullmatch(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _parse_managed_readonly_command(command: str) -> list[tuple[str, list[str]]] | None:
+    """Parse the small, read-only shell grammar used by ACP probes."""
+    normalized = command.strip()
+    if not normalized or len(normalized) > 6000 or "\x00" in normalized:
+        return None
+    if any(marker in normalized for marker in ("$((", "$(", "`", "\n", "\r")):
+        return None
+    lexer = shlex.shlex(normalized, posix=True, punctuation_chars=";&|()<>")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    operators = {"&&", "||", ";", "|", "(", ")"}
+    steps: list[tuple[str, list[str]]] = []
+    current: list[str] = []
+    separator = ";"
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "2" and i + 2 < len(tokens) and tokens[i + 1] == ">&" and tokens[i + 2] == "1":
+            i += 3
+            continue
+        if token in operators:
+            if current:
+                steps.append((separator, current))
+                current = []
+            separator = token if token not in {"(", ")"} else ";"
+            i += 1
+            continue
+        if token in {">", ">>", "<", "&", "&&&", "|&", ">&"}:
+            return None
+        current.append(token)
+        i += 1
+    if current:
+        steps.append((separator, current))
+    if not steps:
+        return None
+
+    for _, segment in steps:
+        program = segment[0].lower()
+        args = segment[1:]
+        if program == "pwd":
+            if args:
+                return None
+        elif program in {"echo", "printf"}:
+            pass
+        elif program == "ls":
+            if any(arg.startswith("-") and arg not in {"-1", "-a", "-la", "-al"} for arg in args):
+                return None
+        elif program == "head":
+            if any(
+                not re.fullmatch(r"-\d+", arg) and arg not in {"-n", "3", "5", "20"}
+                for arg in args
+            ):
+                return None
+        elif program == "timeout":
+            if len(args) < 2 or not re.fullmatch(r"\d+(?:\.\d+)?", args[0]):
+                return None
+            if float(args[0]) > 60:
+                return None
+            nested = _parse_managed_readonly_command(" ".join(args[1:]))
+            if nested is None:
+                return None
+        elif program == "hermes":
+            if args != ["--version"]:
+                return None
+        elif program == "git":
+            if not args or args[0] not in {"status", "rev-parse"}:
+                return None
+            if args[0] == "status" and any(arg not in {"--short"} for arg in args[1:]):
+                return None
+            if args[0] == "rev-parse" and any(
+                arg not in {"--short", "HEAD", "--show-toplevel"} for arg in args[1:]
+            ):
+                return None
+        else:
+            return None
+        if any("$((" in arg or "$(" in arg or "`" in arg for arg in segment):
+            return None
+    return steps
+
+
+def _is_managed_readonly_command(command: str) -> bool:
+    """Classify a task-scoped probe using the restricted read-only grammar."""
+    return _parse_managed_readonly_command(command) is not None
+
+
+def _execute_managed_readonly_native(command: str, **kwargs: Any) -> dict:
+    """Execute an accepted ACP probe without invoking Bash or a shell."""
+    steps = _parse_managed_readonly_command(command)
+    if steps is None:
+        return {"output": "Command blocked: read-only probe grammar rejected it.\n", "returncode": 126}
+    from tools.environments.local import _resolve_safe_cwd
+
+    cwd = _resolve_safe_cwd(kwargs.get("cwd") or os.getcwd())
+    env = _managed_multica_env()
+    deadline = time.monotonic() + min(float(kwargs.get("timeout") or 60), 60.0)
+    output_parts: list[str] = []
+    previous_rc = 0
+
+    def git_root() -> Path | None:
+        path = Path(cwd).resolve()
+        for candidate in (path, *path.parents):
+            if (candidate / ".git").exists():
+                return candidate
+        return None
+
+    def run_argv(argv: list[str]) -> tuple[str, int]:
+        remaining = max(0.1, deadline - time.monotonic())
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=min(15.0, remaining),
+            )
+            return completed.stdout or "", completed.returncode
+        except subprocess.TimeoutExpired:
+            return "[read-only command timed out]\n", 124
+
+    for operator, segment in steps:
+        if operator == "&&" and previous_rc != 0:
+            continue
+        if operator == "||" and previous_rc == 0:
+            continue
+        program, *args = segment
+        lower = program.lower()
+        if lower == "timeout":
+            # The parser has already validated the duration and nested command.
+            lower = args[1].lower()
+            program = args[1]
+            args = args[2:]
+        if operator == "|" and lower == "head" and output_parts:
+            count = 3
+            if "-n" in args:
+                try:
+                    count = int(args[args.index("-n") + 1])
+                except (ValueError, IndexError):
+                    count = 3
+            output_parts[:] = ["\n".join("".join(output_parts).splitlines()[:count]) + "\n"]
+            previous_rc = 0
+            continue
+        if lower == "pwd":
+            result, rc = f"{_display_msys_cwd(cwd)}\n", 0
+        elif lower == "echo":
+            result, rc = " ".join(args).replace("$?", str(previous_rc)) + "\n", 0
+        elif lower == "printf":
+            fmt = args[0] if args else ""
+            try:
+                result = bytes(fmt, "utf-8").decode("unicode_escape")
+            except UnicodeDecodeError:
+                result = fmt
+            for value in args[1:]:
+                result = result.replace("%s", value, 1)
+            rc = 0
+        elif lower == "hermes":
+            result, rc = run_argv([str(_HERMES_NATIVE_BIN), "--version"])
+        elif lower == "git":
+            if git_root() is None:
+                result, rc = "fatal: not a git repository (or any of the parent directories): .git\n", 128
+            else:
+                result, rc = run_argv(["git", *args])
+        elif lower == "ls":
+            flags = [arg for arg in args if arg.startswith("-")]
+            targets = [arg for arg in args if not arg.startswith("-")] or ["."]
+            chunks: list[str] = []
+            rc = 0
+            for target in targets:
+                path = Path(os.path.expandvars(target))
+                if not path.is_absolute():
+                    path = Path(cwd) / path
+                if not path.exists():
+                    chunks.append(f"ls: cannot access '{target}': No such file or directory\n")
+                    rc = 2
+                elif path.is_dir():
+                    names = sorted(item.name for item in path.iterdir() if "-a" in flags or "-l" in flags or not item.name.startswith("."))
+                    chunks.append("\n".join(names) + ("\n" if names else ""))
+                else:
+                    chunks.append(f"{path.name}\n")
+            result = "".join(chunks)
+        elif lower == "head":
+            count = 3
+            if "-n" in args:
+                try:
+                    count = int(args[args.index("-n") + 1])
+                except (ValueError, IndexError):
+                    count = 3
+            result = "\n".join("".join(output_parts).splitlines()[:count]) + "\n"
+            rc = 0
+        else:
+            return {"output": "Command blocked: read-only probe grammar rejected it.\n", "returncode": 126}
+        output_parts.append(result)
+        previous_rc = rc
+        if time.monotonic() >= deadline:
+            return {"output": "".join(output_parts) + "[read-only probe timed out]\n", "returncode": 124}
+    return {"output": "".join(output_parts), "returncode": previous_rc, "cwd_observed": True}
+
+
+def _is_managed_readonly_probe(command: str) -> bool:
+    """Allow only the fixed ACP environment probe, fail-closed on writes."""
+    normalized = command.strip()
+    required = (
+        "pwd",
+        "git status --short",
+        "git rev-parse --short HEAD",
+        "HERMES_PROFILE",
+        "HERMES_HOME",
+        "hermes-home",
+        "hermes --version",
+    )
+    forbidden = (
+        "rm ",
+        "touch ",
+        "mkdir ",
+        "rmdir ",
+        "del ",
+        "remove ",
+        "git add",
+        "git commit",
+        "git push",
+        "git reset",
+        "issue update",
+        "issue comment create",
+        "curl ",
+        "wget ",
+        " >>",
+        " > ",
+    )
+    return (
+        len(normalized) <= 5000
+        and all(token.lower() in normalized.lower() for token in required)
+        and not any(token.lower() in normalized.lower() for token in forbidden)
+    )
+
+
+def _execute_managed_readonly_probe_direct(
+    command: str,
+    **kwargs: Any,
+) -> dict:
+    """Compatibility entrypoint for the native ACP read-only runner."""
+    return _execute_managed_readonly_native(command, **kwargs)
+
+
+def _is_managed_readonly_fs_command(command: str) -> bool:
+    """Compatibility wrapper for the generic read-only classifier."""
+    return _is_managed_readonly_command(command)
+
+
+def _display_msys_cwd(cwd: str) -> str:
+    """Format a Windows CWD like Git Bash's ``pwd`` output."""
+    path = Path(cwd).resolve()
+    drive = path.drive.rstrip(":\\/").lower()
+    rest = path.as_posix()
+    if drive and rest[:2].lower() == f"{drive}:":
+        rest = rest[2:]
+    return f"/{drive}{rest}" if drive else rest
+
+
+def _execute_managed_readonly_fs_direct(
+    command: str,
+    **kwargs: Any,
+) -> dict:
+    """Execute the fixed ACP pwd/status probes without a shell wrapper."""
+    from tools.environments.local import _resolve_safe_cwd
+
+    cwd = _resolve_safe_cwd(kwargs.get("cwd") or os.getcwd())
+    pwd_line = _display_msys_cwd(cwd)
+    normalized = command.strip()
+    simple_commands = {
+        "git status --short": ["git", "status", "--short"],
+        "git rev-parse --short HEAD": ["git", "rev-parse", "--short", "HEAD"],
+        "hermes --version": [str(_HERMES_NATIVE_BIN), "--version"],
+    }
+    if normalized.lower() == "hermes --version" and not _HERMES_NATIVE_BIN.is_file():
+        simple_commands["hermes --version"] = ["hermes", "--version"]
+    argv = simple_commands.get(normalized)
+    if argv is not None:
+        result = subprocess.run(
+            argv,
+            cwd=cwd,
+            env=_managed_multica_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=kwargs.get("timeout") or 60,
+        )
+        return {"output": result.stdout or "", "returncode": result.returncode, "cwd_observed": True}
+    if normalized.lower() == "pwd":
+        output = f"{pwd_line}\n"
+        return {"output": output, "returncode": 0, "cwd_observed": True}
+    if re.fullmatch(r"pwd; echo [\"']pwd_exit=\$\?[\"']", normalized, flags=re.IGNORECASE):
+        output = f"{pwd_line}\npwd_exit=0\n"
+        return {"output": output, "returncode": 0, "cwd_observed": True}
+
+    result = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=cwd,
+        env=_managed_multica_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=kwargs.get("timeout") or 60,
+    )
+    output = f"{pwd_line}\n--- git status --short ---\n{result.stdout}exit={result.returncode}\n"
+    return {"output": output, "returncode": result.returncode, "cwd_observed": True}
+
+
+_MULTICA_NATIVE_BIN = Path(
+    r"C:\\Users\\Adel\\AppData\\Local\\Programs\\@multicadesktop\\resources\\app.asar.unpacked\\resources\\bin\\multica.exe"
+)
+
+
+_HERMES_NATIVE_BIN = Path("C:/Users/Adel/AppData/Local/hermes/hermes-agent/bin/hermes.exe")
+
+
+def _managed_multica_native_argv(command: str) -> list[str] | None:
+    """Translate an approved read-only Multica command to native argv."""
+    normalized = command.strip()
+    match = re.fullmatch(
+        r"multica(?:\.exe)? issue get ([A-Za-z0-9_-]+) --output json",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return [str(_MULTICA_NATIVE_BIN), "issue", "get", match.group(1), "--output", "json"]
+
+    match = re.fullmatch(
+        r"multica(?:\.exe)? issue comment list ([A-Za-z0-9_-]+) "
+        r"--roots-only --summary --compact --output json",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return [
+            str(_MULTICA_NATIVE_BIN),
+            "issue",
+            "comment",
+            "list",
+            match.group(1),
+            "--roots-only",
+            "--summary",
+            "--compact",
+            "--output",
+            "json",
+        ]
+    return None
+
+
+def _managed_multica_env() -> dict[str, str]:
+    """Build the minimal task environment for the Multica CLI."""
+    keep_exact = {
+        "HERMES_HOME",
+        "HOME",
+        "USERPROFILE",
+        "TEMP",
+        "TMP",
+        "COMSPEC",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+    }
+    result = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper().startswith("MULTICA_")
+        or key in keep_exact
+        or key.upper() == "PATH"
+    }
+    task_token = os.environ.get("_HERMES_FORCE_MULTICA_TOKEN") or os.environ.get("MULTICA_TOKEN", "")
+    if task_token.startswith("mat_"):
+        result["MULTICA_TOKEN"] = task_token
+    result.setdefault("MSYS_NO_PATHCONV", "1")
+    result.setdefault("MSYS2_ARG_CONV_EXCL", "*")
+    return result
+
+
+def _execute_managed_multica_direct(
+    env: Any,
+    command: str,
+    **kwargs: Any,
+) -> dict:
+    """Run a task-local Multica CLI command without the login-shell wrapper."""
+    from tools.environments.local import _find_bash, _make_run_env, _resolve_safe_cwd
+
+    timeout = min(kwargs.get("timeout") or getattr(env, "timeout", 180), 60)
+    cwd = _resolve_safe_cwd(kwargs.get("cwd") or getattr(env, "cwd", None) or os.getcwd())
+    logger.info("managed Multica subprocess start cwd=%s timeout=%s", cwd, timeout)
+    native_argv = _managed_multica_native_argv(command)
+    if native_argv is None:
+        return {
+            "output": "Command blocked: ACP task terminal allows read-only Multica queries only.\n",
+            "returncode": 126,
+            "cwd_observed": True,
+        }
+    run_env = _managed_multica_env()
+    logger.info("managed Multica subprocess env ready task=%s", os.environ.get("MULTICA_TASK_ID", "")[:8])
+    native_argv = _managed_multica_native_argv(command)
+    if native_argv is not None and _MULTICA_NATIVE_BIN.is_file():
+        run_argv = native_argv
+        logger.info("managed Multica native binary selected")
+    else:
+        bash_candidates = (
+            r"C:\\Program Files\\Git\\bin\\bash.exe",
+            r"C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+        )
+        bash = next((candidate for candidate in bash_candidates if Path(candidate).is_file()), None)
+        if bash is None:
+            bash = _find_bash()
+        run_argv = [bash, "-c", command]
+        logger.info("managed Multica subprocess shell ready")
+    try:
+        completed = subprocess.run(
+            run_argv,
+            cwd=cwd,
+            env=run_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        logger.info("managed Multica subprocess finished returncode=%s", completed.returncode)
+        return {
+            "output": completed.stdout or "",
+            "returncode": completed.returncode,
+            "cwd_observed": True,
+        }
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        return {
+            "output": f"{output}\n[Command timed out after {timeout}s]".lstrip(),
+            "returncode": 124,
+            "cwd_observed": True,
+        }
+
+
+def _execute_with_task_lock(env: Any, task_id: str, command: str, **kwargs: Any) -> dict:
+    """Serialize commands that share one terminal environment."""
+    key = task_id or "default"
+    with _execution_locks_lock:
+        lock = _execution_locks.setdefault(key, threading.Lock())
+    with lock:
+        if (
+            task_id
+            and os.environ.get("MULTICA_TASK_ID", "").strip() == task_id
+            and command.lstrip().lower().startswith(("multica ", "multica.exe "))
+        ):
+            return _execute_managed_multica_direct(env, command, **kwargs)
+        if task_id and os.environ.get("MULTICA_TASK_ID", "").strip() == task_id and _is_managed_readonly_probe(command):
+            return _execute_managed_readonly_probe_direct(command, **kwargs)
+        if task_id and os.environ.get("MULTICA_TASK_ID", "").strip() == task_id and _is_managed_readonly_fs_command(command):
+            return _execute_managed_readonly_fs_direct(command, **kwargs)
+        return env.execute(command, **kwargs)
 
 
 def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
@@ -1382,6 +1862,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     ``delegate_task`` children keep sharing the parent's container via the
     alias registry (``register_container_alias``).
     """
+    managed_task_id = os.environ.get("MULTICA_TASK_ID", "").strip()
+    if managed_task_id:
+        # The daemon task identity is authoritative even when the tool adapter
+        # passes a session id or the implicit ``default`` placeholder.
+        return managed_task_id
+
     if task_id and _has_isolation_overrides(task_id):
         return task_id
     if task_id and _docker_session_isolation_enabled():
@@ -2727,6 +3213,37 @@ def terminal_tool(
             )
         effective_timeout = timeout or default_timeout
 
+        if (
+            not background
+            and os.environ.get("MULTICA_TASK_ID", "").strip()
+            and (
+                _is_managed_multica_read_command(command)
+                or _is_managed_readonly_command(command)
+            )
+        ):
+            logger.info("managed read-only direct terminal path task=%s", effective_task_id[:8])
+            if _is_managed_multica_read_command(command):
+                direct_result = _execute_managed_multica_direct(
+                    None,
+                    command,
+                    timeout=effective_timeout,
+                    cwd=cwd,
+                )
+            else:
+                direct_result = _execute_managed_readonly_probe_direct(
+                    command,
+                    timeout=min(effective_timeout or 60, 60),
+                    cwd=cwd,
+                )
+            return json.dumps(
+                {
+                    "output": direct_result.get("output", ""),
+                    "exit_code": direct_result.get("returncode", 1),
+                    "error": None,
+                },
+                ensure_ascii=False,
+            )
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
@@ -2921,9 +3438,11 @@ def terminal_tool(
                 # redirect keeps leading-dash paths out of argv (same form as
                 # tools/image_source.py).
                 try:
-                    result = env.execute(
+                    result = _execute_with_task_lock(
+                        env,
+                        effective_task_id,
                         f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
-                        f"< {shlex.quote(script_path)}"
+                        f"< {shlex.quote(script_path)}",
                     )
                     if result.get("returncode", -1) == 0:
                         output = result.get("output", "")
@@ -3349,7 +3868,12 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    result = _execute_with_task_lock(
+                        env,
+                        effective_task_id,
+                        command,
+                        **execute_kwargs,
+                    )
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

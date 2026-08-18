@@ -486,6 +486,18 @@ def load_hermes_dotenv(
     """
     loaded: list[Path] = []
 
+    # Multica injects a task-scoped token before launching an ACP worker.
+    # Profile and managed .env files may contain the workspace token (mul_),
+    # but they must never overwrite the task token (mat_).
+    task_scoped_multica_token = os.environ.get("MULTICA_TOKEN", "")
+    if not task_scoped_multica_token.startswith("mat_"):
+        task_scoped_multica_token = None
+    else:
+        # Keep a private, force-priority copy for terminal subprocesses. A
+        # later profile dotenv reload may replace MULTICA_TOKEN with the
+        # workspace mul_ token; _make_run_env already understands this bridge.
+        os.environ["_HERMES_FORCE_MULTICA_TOKEN"] = task_scoped_multica_token
+
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
@@ -551,6 +563,12 @@ def load_hermes_dotenv(
     # so the merged config (which already carries the managed overlay) is
     # what lands in the env.
     _reapply_terminal_config_bridge(home_path)
+
+    # Restore the daemon-injected task token after every dotenv/managed-env
+    # overlay. The workspace token remains the normal CLI fallback when no mat_
+    # token was injected.
+    if task_scoped_multica_token is not None:
+        os.environ["MULTICA_TOKEN"] = task_scoped_multica_token
 
     return loaded
 

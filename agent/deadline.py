@@ -92,9 +92,10 @@ __all__ = [
 # ``Thread.join(timeout=...)`` deadlines to an absolute timestamp; very large
 # relative timeouts overflow ``time_t`` on macOS and raise
 # ``OverflowError: timestamp out of range for platform time_t`` (#83220).
-# One year is semantically "unbounded" for every wait in this codebase while
-# staying far below any platform conversion limit.
-MAX_SAFE_TIMEOUT_S = 31_536_000.0  # 365 days
+# Windows' ``threading.Lock.acquire(timeout=...)`` rejects values above
+# approximately 2**32 milliseconds. Keep a conservative cross-platform ceiling
+# instead of the old one-year value, which overflowed on Windows.
+MAX_SAFE_TIMEOUT_S = 4_294_000.0
 
 # Grace period after a deadline fires before concluding the event loop thread
 # is blocked in a synchronous call and dumping stacks (family A diagnostics).

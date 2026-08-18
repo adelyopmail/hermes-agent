@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import uuid
+from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from threading import Lock
@@ -25,11 +26,30 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_ACP_TASK_MAX_ITERATIONS = 8
+
+
+def _acp_task_max_iterations() -> int | None:
+    """Return a short turn budget for daemon-launched Multica ACP tasks."""
+    return _ACP_TASK_MAX_ITERATIONS if os.environ.get("MULTICA_TASK_ID", "").strip() else None
+
+
+def _task_profile_identity(cwd: str) -> str | None:
+    """Read the role identity stamped by Multica into the ACP workdir."""
+    agents_file = Path(cwd) / "AGENTS.md"
+    try:
+        text = agents_file.read_text(encoding="utf-8", errors="replace")[:100_000]
+    except OSError:
+        return None
+    match = re.search(r"You are:\s*(Engineer A|Engineer B|Stéphane)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    name = match.group(1).lower()
+    return {"engineer a": "engineer-a", "engineer b": "engineer-b", "stéphane": "default"}.get(name)
+
 
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values when Hermes itself is running in WSL.
-
-    Windows ACP clients can launch ``hermes acp`` inside WSL while still sending
     editor workspaces as Windows drive paths (``E:\\Projects``) or
     ``\\\\wsl.localhost\\`` UNC paths. Store and execute against the POSIX form so
     agents, tools, and persisted ACP sessions all agree on the usable workspace.
@@ -207,13 +227,28 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".") -> SessionState:
+    def create_session(
+        self,
+        cwd: str = ".",
+        *,
+        model: str | None = None,
+        requested_provider: str | None = None,
+        base_url: str | None = None,
+        api_mode: str | None = None,
+    ) -> SessionState:
         """Create a new session with a unique ID and a fresh AIAgent."""
         import threading
 
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=session_id, cwd=cwd)
+        agent = self._make_agent(
+            session_id=session_id,
+            cwd=cwd,
+            model=model,
+            requested_provider=requested_provider,
+            base_url=base_url,
+            api_mode=api_mode,
+        )
         state = SessionState(
             session_id=session_id,
             agent=agent,
@@ -626,6 +661,34 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
+        effective_model = model or default_model
+        effective_provider = requested_provider or config_provider
+        if effective_model and "/" in effective_model:
+            # Multica passes qualified ids such as
+            # ``opencode-go/deepseek-v4-flash`` to ACP. The regular Hermes
+            # CLI resolves this through its explicit --provider flag, but ACP
+            # session/new may provide only the model string. Split the provider
+            # at this boundary so a shared Codex default cannot reject a model
+            # owned by another provider.
+            provider_prefix, model_suffix = effective_model.split("/", 1)
+            if provider_prefix and model_suffix:
+                effective_provider = provider_prefix
+                effective_model = model_suffix
+        if effective_model:
+            try:
+                from hermes_cli.models import parse_model_input
+
+                parsed_provider, parsed_model = parse_model_input(
+                    effective_model,
+                    effective_provider or "auto",
+                )
+                if parsed_model:
+                    effective_model = parsed_model
+                if parsed_provider:
+                    effective_provider = parsed_provider
+            except Exception:
+                logger.debug("ACP model/provider parsing failed", exc_info=True)
+
         configured_mcp_servers = [
             name
             for name, cfg in (config.get("mcp_servers") or {}).items()
@@ -641,11 +704,14 @@ class SessionManager:
             "quiet_mode": True,
             "session_id": session_id,
             "session_db": self._get_db(),
-            "model": model or default_model,
+            "model": effective_model,
         }
+        task_max_iterations = _acp_task_max_iterations()
+        if task_max_iterations is not None:
+            kwargs["max_iterations"] = task_max_iterations
 
         try:
-            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            runtime = resolve_runtime_provider(requested=effective_provider)
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
@@ -660,6 +726,14 @@ class SessionManager:
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)
+        task_profile = _task_profile_identity(cwd)
+        if task_profile:
+            logger.info(
+                "ACP task profile identity task=%s profile=%s cwd=%s",
+                os.environ.get("MULTICA_TASK_ID", "")[:8],
+                task_profile,
+                cwd,
+            )
 
         # Bounded wait for background MCP discovery so already-spawning fast
         # servers land in the agent's tool snapshot.  ACP entry.py fires
@@ -685,6 +759,7 @@ class SessionManager:
             logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
 
         agent = AIAgent(**kwargs)
+        agent._acp_task_profile = task_profile
         # Codex app-server sessions are spawned lazily on the first turn. Stamp
         # the ACP workspace onto the agent so the Codex runtime starts from the
         # editor/session cwd instead of the Hermes daemon's process cwd.
