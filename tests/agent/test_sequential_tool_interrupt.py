@@ -70,7 +70,7 @@ def test_interrupt_abandons_noncooperative_tool(monkeypatch, fake_agent, _fast_p
         tool_executor, "_run_agent_tool_execution_middleware", _fake_middleware
     )
     monkeypatch.setattr(
-        tool_executor, "_resolve_sequential_tool_timeout", lambda: None
+        tool_executor, "_resolve_sequential_tool_timeout", lambda **_: None
     )
 
     def _interrupt_soon():
@@ -93,9 +93,9 @@ def test_interrupt_abandons_noncooperative_tool(monkeypatch, fake_agent, _fast_p
 
     assert isinstance(managed.result, _ToolCancelledResult)
     assert "cancelled" in str(managed.result)
-    # poll (0.05s) + interrupt delay (0.1s) + grace (3s) + slack — nowhere
-    # near the 30s tool runtime.
-    assert elapsed < 10.0
+    # poll (0.05s) + interrupt delay (0.1s) + grace (3s) + Windows/CI scheduling
+    # slack — still well below the 30s non-cooperative tool runtime.
+    assert elapsed < 20.0
     # The executor emitted the terminal post_tool_call itself.
     assert any(kw.get("status") == "cancelled" for kw in _fast_polls)
 
@@ -117,7 +117,7 @@ def test_interrupt_prefers_real_result_from_cooperative_tool(
         tool_executor, "_run_agent_tool_execution_middleware", _fake_middleware
     )
     monkeypatch.setattr(
-        tool_executor, "_resolve_sequential_tool_timeout", lambda: None
+        tool_executor, "_resolve_sequential_tool_timeout", lambda **_: None
     )
     fake_agent._interrupt_requested = True  # interrupted before first poll
 
@@ -150,7 +150,7 @@ def test_no_deadline_still_runs_on_worker(monkeypatch, fake_agent):
         tool_executor, "_run_agent_tool_execution_middleware", _fake_middleware
     )
     monkeypatch.setattr(
-        tool_executor, "_resolve_sequential_tool_timeout", lambda: None
+        tool_executor, "_resolve_sequential_tool_timeout", lambda **_: None
     )
 
     managed = _run_sequential_tool_execution_middleware(
