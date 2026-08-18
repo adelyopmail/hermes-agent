@@ -573,11 +573,14 @@ class HonchoClientConfig:
             or raw.get("aiPeer")
             or resolved_host
         )
-        api_key = (
-            host_block.get("apiKey")
-            or raw.get("apiKey")
-            or get_secret("HONCHO_API_KEY")
-        )
+        env_api_key = get_secret("HONCHO_API_KEY")
+        host_api_key = host_block.get("apiKey")
+        root_api_key = raw.get("apiKey")
+        # An explicitly configured static API key must take precedence over
+        # legacy OAuth material left in the host block. Otherwise a valid
+        # HONCHO_API_KEY is silently ignored and the client keeps expiring
+        # with the old OAuth access token.
+        api_key = env_api_key or host_api_key or root_api_key
         # Named-profile host blocks do NOT inherit the default host's apiKey —
         # profiles are isolated islands by design (see resolve_active_host).
         # But the failure mode is silent: the profile runs unauthenticated and
@@ -992,7 +995,10 @@ def _credential_fingerprint(config: HonchoClientConfig | None) -> str:
         if config is not None:
             block = _host_block(config.raw or {}, config.host)
             oauth_block = block.get("oauth")
-            if isinstance(oauth_block, dict) and oauth_block.get("refreshToken"):
+            env_api_key = get_secret("HONCHO_API_KEY")
+            if env_api_key:
+                basis = f"key:{env_api_key}"
+            elif isinstance(oauth_block, dict) and oauth_block.get("refreshToken"):
                 basis = f"oauth:{oauth_block['refreshToken']}"
             elif config.api_key:
                 basis = f"key:{config.api_key}"
@@ -1007,10 +1013,13 @@ def _credential_fingerprint(config: HonchoClientConfig | None) -> str:
             raw = json.loads(path.read_text(encoding="utf-8"))
             block = _host_block(raw, resolve_active_host())
             oauth_block = block.get("oauth")
-            if isinstance(oauth_block, dict) and oauth_block.get("refreshToken"):
+            env_api_key = get_secret("HONCHO_API_KEY")
+            if env_api_key:
+                basis = f"key:{env_api_key}"
+            elif isinstance(oauth_block, dict) and oauth_block.get("refreshToken"):
                 basis = f"oauth:{oauth_block['refreshToken']}"
             else:
-                key = block.get("apiKey") or raw.get("apiKey") or get_secret("HONCHO_API_KEY") or ""
+                key = block.get("apiKey") or raw.get("apiKey") or ""
                 if not key:
                     return ""
                 basis = f"key:{key}"
@@ -1160,12 +1169,11 @@ def _resolve_timeout_from_sources(config: HonchoClientConfig | None) -> float:
 
 
 def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
-    """Refresh a near-expiry OAuth grant and point ``config.api_key`` at it.
-
-    No-op for static API keys or when refresh fails: the stale token stays in
-    place and the first rejected call triggers the post-401 recovery in
-    session.py (forced rotation, one retry).
-    """
+    """Refresh a near-expiry OAuth grant unless a static API key is configured."""
+    # HONCHO_API_KEY is the durable operator credential. Never let the legacy
+    # OAuth block override it or trigger a refresh that replaces config.api_key.
+    if get_secret("HONCHO_API_KEY"):
+        return
     try:
         from plugins.memory.honcho import oauth
 
@@ -1185,12 +1193,9 @@ def _refresh_cached_oauth(
     config: HonchoClientConfig | None,
     slot: SingletonSlot | None = None,
 ) -> None:
-    """Rotate the cached client's Bearer in place when its OAuth token is stale.
-
-    If the SDK shape changed and the in-place rotation can't apply, the
-    client's own slot is reset so the next acquisition rebuilds with the
-    fresh token.
-    """
+    """Rotate a cached OAuth client unless a static API key is configured."""
+    if get_secret("HONCHO_API_KEY"):
+        return
     try:
         from plugins.memory.honcho import oauth
 

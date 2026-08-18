@@ -69,6 +69,25 @@ class TestHonchoClientConfigAutoEnable:
         assert cfg.api_key == "env-test-key"
         assert cfg.enabled is True
 
+    def test_env_api_key_overrides_legacy_oauth_host(self, tmp_path, monkeypatch):
+        """A durable env API key must win over stale host OAuth material."""
+        monkeypatch.setenv("HONCHO_API_KEY", "env-static-key")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({
+            "hosts": {
+                "hermes": {
+                    "enabled": True,
+                    "apiKey": "stale-oauth-access-token",
+                    "oauth": {"refreshToken": "stale-refresh-token"},
+                }
+            }
+        }))
+
+        cfg = HonchoClientConfig.from_global_config(config_path=config_path)
+
+        assert cfg.api_key == "env-static-key"
+        assert cfg.enabled is True
+
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits not enforced on Windows")
