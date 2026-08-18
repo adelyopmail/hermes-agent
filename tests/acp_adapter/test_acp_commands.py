@@ -74,6 +74,16 @@ def make_agent_and_state():
     return acp_agent, state, fake, conn
 
 
+def test_acp_task_profile_identity_is_read_from_multica_workdir(tmp_path):
+    from acp_adapter.session import _task_profile_identity
+
+    (tmp_path / "AGENTS.md").write_text(
+        "**You are: Engineer A** (ID: `917120f4-d494-4fbb-9636-62627e8efa87`)\n",
+        encoding="utf-8",
+    )
+    assert _task_profile_identity(str(tmp_path)) == "engineer-a"
+
+
 def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     """ACP sessions persist to SessionDB; recall must receive the same DB handle."""
     captured = {}

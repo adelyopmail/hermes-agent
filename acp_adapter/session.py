@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import uuid
+from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from threading import Lock
@@ -33,10 +34,22 @@ def _acp_task_max_iterations() -> int | None:
     return _ACP_TASK_MAX_ITERATIONS if os.environ.get("MULTICA_TASK_ID", "").strip() else None
 
 
+def _task_profile_identity(cwd: str) -> str | None:
+    """Read the role identity stamped by Multica into the ACP workdir."""
+    agents_file = Path(cwd) / "AGENTS.md"
+    try:
+        text = agents_file.read_text(encoding="utf-8", errors="replace")[:100_000]
+    except OSError:
+        return None
+    match = re.search(r"You are:\s*(Engineer A|Engineer B|Stéphane)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    name = match.group(1).lower()
+    return {"engineer a": "engineer-a", "engineer b": "engineer-b", "stéphane": "default"}.get(name)
+
+
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values when Hermes itself is running in WSL.
-
-    Windows ACP clients can launch ``hermes acp`` inside WSL while still sending
     editor workspaces as Windows drive paths (``E:\\Projects``) or
     ``\\\\wsl.localhost\\`` UNC paths. Store and execute against the POSIX form so
     agents, tools, and persisted ACP sessions all agree on the usable workspace.
@@ -713,6 +726,14 @@ class SessionManager:
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)
+        task_profile = _task_profile_identity(cwd)
+        if task_profile:
+            logger.info(
+                "ACP task profile identity task=%s profile=%s cwd=%s",
+                os.environ.get("MULTICA_TASK_ID", "")[:8],
+                task_profile,
+                cwd,
+            )
 
         # Bounded wait for background MCP discovery so already-spawning fast
         # servers land in the agent's tool snapshot.  ACP entry.py fires
@@ -738,6 +759,7 @@ class SessionManager:
             logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
 
         agent = AIAgent(**kwargs)
+        agent._acp_task_profile = task_profile
         # Codex app-server sessions are spawned lazily on the first turn. Stamp
         # the ACP workspace onto the agent so the Codex runtime starts from the
         # editor/session cwd instead of the Hermes daemon's process cwd.
